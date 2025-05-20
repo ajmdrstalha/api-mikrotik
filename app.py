@@ -10,42 +10,84 @@ Requirements:
 import os
 import html
 import ipaddress
-from flask import Flask, render_template_string, request, redirect, url_for, flash
+from flask import Flask, render_template_string, request, redirect, url_for, flash, session
 from routeros_api import RouterOsApiPool
 from dotenv import load_dotenv   # harmless if .env is absent
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 load_dotenv()   # pull MT_HOST, MT_USER... from a .env file if present
 
-MT_HOST = os.getenv("MT_HOST", "27.131.13.150")
-MT_USER = os.getenv("MT_USER", "talha")
-MT_PASS = os.getenv("MT_PASS", "jis2010#")
-MT_PORT = int(os.getenv("MT_PORT", "8728"))           # API port
-
-# ─── Helper to (re)connect quickly ─────────────────────────────────────────────
-def get_api_pool():
-    return RouterOsApiPool(
-        host=MT_HOST,
-        username=MT_USER,
-        password=MT_PASS,
-        port=MT_PORT,
-        plaintext_login=True,
-        use_ssl=False,          # flip to True if you use API‑SSL
-    )
-
-# ─── Flask app set‑up ──────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.urandom(16)   # only for flash() messages
+app.secret_key = os.urandom(16)   # needed for flash messages and session
 
-# ─── Jinja2 template, kept inline for a self‑contained file ────────────────────
-PAGE = """
+# ─── Templates ────────────────────────────────────────────────────────────────
+LOGIN_PAGE = """
 <!doctype html>
-<title>MikroTik Interface Manager</title>
-<link rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+<title>MikroTik Login</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
 <section class="section">
 <div class="container">
-  <h1 class="title">MikroTik Interfaces</h1>
+  <h1 class="title">MikroTik Router Login</h1>
+  
+  {% with msgs = get_flashed_messages() %}
+    {% if msgs %}
+      <div class="notification is-danger">{{ msgs[0] }}</div>
+    {% endif %}
+  {% endwith %}
+  
+  <form method="post" action="{{ url_for('login') }}">
+    <div class="field">
+      <label class="label">Router IP/Hostname</label>
+      <div class="control">
+        <input class="input" type="text" name="host" placeholder="192.168.88.1" required>
+      </div>
+    </div>
+    
+    <div class="field">
+      <label class="label">API Port</label>
+      <div class="control">
+        <input class="input" type="number" name="port" value="8728" required>
+      </div>
+    </div>
+    
+    <div class="field">
+      <label class="label">Username</label>
+      <div class="control">
+        <input class="input" type="text" name="username" placeholder="admin" required>
+      </div>
+    </div>
+    
+    <div class="field">
+      <label class="label">Password</label>
+      <div class="control">
+        <input class="input" type="password" name="password" required>
+      </div>
+    </div>
+    
+    <div class="field">
+      <div class="control">
+        <button class="button is-primary">Connect</button>
+      </div>
+    </div>
+  </form>
+</div>
+</section>
+"""
+
+INTERFACE_PAGE = """
+<!doctype html>
+<title>MikroTik Interface Manager</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+<section class="section">
+<div class="container">
+  <div class="level">
+    <div class="level-left">
+      <h1 class="title">MikroTik Interfaces</h1>
+    </div>
+    <div class="level-right">
+      <a href="{{ url_for('logout') }}" class="button is-light">Change Router</a>
+    </div>
+  </div>
 
   {% with msgs = get_flashed_messages() %}
     {% if msgs %}
@@ -94,9 +136,74 @@ PAGE = """
 </section>
 """
 
+# ─── Helper to (re)connect quickly ─────────────────────────────────────────────
+def get_api_pool():
+    return RouterOsApiPool(
+        host=session['host'],
+        username=session['username'],
+        password=session['password'],
+        port=session['port'],
+        plaintext_login=True,
+        use_ssl=False,
+    )
+
 # ─── Routes ────────────────────────────────────────────────────────────────────
-@app.route("/")
-def index():
+@app.route("/", methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        host = request.form['host'].strip()
+        port = request.form['port'].strip()
+        username = request.form['username'].strip()
+        password = request.form['password'].strip()
+
+        # Validate port number
+        try:
+            port = int(port)
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            flash("Invalid port number. Must be between 1 and 65535")
+            return render_template_string(LOGIN_PAGE)
+
+        # Test connection
+        try:
+            pool = RouterOsApiPool(
+                host=host,
+                username=username,
+                password=password,
+                port=port,
+                plaintext_login=True,
+                use_ssl=False,
+            )
+            api = pool.get_api()
+            api.get_resource('/system/resource').get()
+            
+            # Store credentials in session
+            session['host'] = host
+            session['port'] = port
+            session['username'] = username
+            session['password'] = password
+            
+            pool.disconnect()
+            return redirect(url_for('interface_manager'))
+        except Exception as e:
+            flash(f"Connection failed: {str(e)}")
+            return render_template_string(LOGIN_PAGE)
+    
+    # Clear any existing session on GET request
+    session.clear()
+    return render_template_string(LOGIN_PAGE)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route("/interfaces")
+def interface_manager():
+    if not all(key in session for key in ['host', 'port', 'username', 'password']):
+        return redirect(url_for('login'))
+
     try:
         pool = get_api_pool()
         api = pool.get_api()
@@ -115,17 +222,19 @@ def index():
         for iface in ifaces:
             iface["ips"] = ip_map.get(iface["name"], [])
 
-        return render_template_string(PAGE, ifaces=ifaces)
+        return render_template_string(INTERFACE_PAGE, ifaces=ifaces)
     except Exception as e:
         flash(f"Error connecting to router: {str(e)}")
-        return render_template_string(PAGE, ifaces=[])
+        return redirect(url_for('login'))
     finally:
         if 'pool' in locals():
             pool.disconnect()
 
-
 @app.route("/update", methods=["POST"])
 def update_ip():
+    if not all(key in session for key in ['host', 'port', 'username', 'password']):
+        return redirect(url_for('login'))
+
     iface = request.form["iface"]
     new_ip = request.form["new_ip"].strip()  # remove any whitespace
 
@@ -134,7 +243,7 @@ def update_ip():
         ipaddress.ip_interface(new_ip)
     except ValueError:
         flash("Invalid IP address format! Please use format like 192.168.1.1/24")
-        return redirect(url_for("index"))
+        return redirect(url_for('interface_manager'))
 
     pool = get_api_pool()
     api = pool.get_api()
@@ -154,8 +263,7 @@ def update_ip():
     finally:
         pool.disconnect()
 
-    return redirect(url_for("index"))
-
+    return redirect(url_for('interface_manager'))
 
 # ─── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
